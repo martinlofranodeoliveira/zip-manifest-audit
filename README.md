@@ -1,7 +1,7 @@
 # zip-manifest-audit
 
-Offline ZIP central-directory inventory and metadata audit, using only the
-Python standard library. Requires Python 3.10 or later.
+Offline ZIP central-directory inventory, metadata audit and archive comparison,
+using only the Python standard library. Requires Python 3.10 or later.
 
 [English](#english) · [Português](#português)
 
@@ -115,6 +115,71 @@ table delimiters, newlines, inline links, bare URLs and email links. These
 formats are **not a secrets scrubber**: source names, member names, paths and
 other report data can still be sensitive. Review reports before sharing them.
 
+### Compare two ZIPs
+
+Compare central-directory claims before and after an archive update:
+
+```sh
+python -m zip_manifest_audit before.zip --compare after.zip
+python -m zip_manifest_audit before.zip --compare after.zip --format markdown
+python -m zip_manifest_audit before.zip --compare after.zip --fail-on-changes
+```
+
+```python
+from zip_manifest_audit import ArchiveError, compare_zips
+
+try:
+    comparison = compare_zips("before.zip", "after.zip", max_ratio=1000)
+except ArchiveError:
+    print("The archives could not be compared.")
+else:
+    print(comparison["summary"])
+    for change in comparison["changed"]:
+        print(repr(change["name"]), change["occurrence"], change["fields"])
+```
+
+`compare_zips(before, after, *, max_ratio=1000)` returns:
+
+| Key | Contents |
+| --- | --- |
+| `before`, `after` | Complete `audit_zip` reports, including each source's exact-byte SHA-256, entries, summary and findings. |
+| `added`, `removed` | Rows with `name`, `occurrence` and `entry` (the complete corresponding audit entry). |
+| `changed` | Rows with `name`, `occurrence`, complete `before` and `after` entries, and `fields` listing changed metadata fields. |
+| `summary` | Integer counts named `added`, `removed`, `changed` and `unchanged`. |
+
+Members match by **exact decoded original name and zero-based occurrence of
+that name** within each directory. Duplicates remain separate. There is no
+case folding or slash, path or Unicode normalization. A renamed member is
+removed and added. Unique-member reordering alone is unchanged: absolute
+central-directory indices are preserved in the original entries but ignored
+when computing deltas. Duplicate occurrences pair in their respective order;
+reordering differently described duplicates can therefore produce changes.
+
+Compared fields, and their order in `fields`, are `is_dir`, `compressed_size`,
+`uncompressed_size`, `crc32`, `compression`, `encrypted`, `is_symlink`.
+Additions and changes follow the later archive's directory order; removals
+follow the earlier archive's order. Empty archives work. Timestamps, comments
+and permission bits other than the existing symlink flag are outside delta
+scope.
+
+Both inputs independently follow the same regular-file, **16 MiB** and
+**10,000-entry** limits and metadata checks described above, including the
+initial directory-parsing limitation. The ratio option applies to both audits.
+Comparison reads each source snapshot without modifying either file, opening
+or decompressing members, extracting files, verifying CRCs, or creating output
+files. Equal metadata **does not establish equal member contents**: CRCs are
+unverified claims. The complete archive SHA-256 digests still distinguish
+different source bytes, including changes outside the compared fields.
+
+The default comparison exit status is 0, including when deltas exist.
+`--fail-on-changes` exits 1 if an addition, removal or metadata change exists;
+using it without `--compare` is an argument error. `--fail-on-findings` exits 1
+if either original audit has findings. When both flags are present, either
+condition causes status 1. Invalid options or either invalid source produce
+status 2, the same generic private stderr diagnostic, and no partial stdout
+report. JSON retains ASCII escaping; Markdown uses the same inert name
+rendering for deltas and both included audits.
+
 ### Synthetic example
 
 ```sh
@@ -128,6 +193,18 @@ compressible data. It refuses to overwrite an existing file. The audit reads
 only directory metadata; it does not follow the example symlink or materialize
 any of these member names on disk. The creator itself writes synthetic member
 data to construct the fixture.
+
+For a complete comparison example, run:
+
+```sh
+python -m examples.compare_synthetic
+```
+
+This creates two small ZIP fixtures in a temporary directory, prints the JSON
+comparison, and removes the fixtures. The summary is one addition, one removal,
+two changes and one unchanged entry, including separately matched duplicate
+names. The example creator writes synthetic payloads; comparison only reads
+directory claims and the source snapshots used for their digests.
 
 Licensed under the [MIT License](LICENSE), copyright MartinLofrano.
 
@@ -245,6 +322,74 @@ e links de e-mail. Esses formatos **não removem segredos**: nomes da origem,
 nomes dos membros, caminhos e outros dados do relatório ainda podem ser
 sensíveis. Revise o relatório antes de compartilhá-lo.
 
+### Comparar dois ZIPs
+
+Compare as declarações do diretório central antes e depois de uma atualização:
+
+```sh
+python -m zip_manifest_audit antes.zip --compare depois.zip
+python -m zip_manifest_audit antes.zip --compare depois.zip --format markdown
+python -m zip_manifest_audit antes.zip --compare depois.zip --fail-on-changes
+```
+
+```python
+from zip_manifest_audit import ArchiveError, compare_zips
+
+try:
+    comparacao = compare_zips("antes.zip", "depois.zip", max_ratio=1000)
+except ArchiveError:
+    print("Não foi possível comparar os arquivos.")
+else:
+    print(comparacao["summary"])
+    for alteracao in comparacao["changed"]:
+        print(repr(alteracao["name"]), alteracao["occurrence"], alteracao["fields"])
+```
+
+`compare_zips(before, after, *, max_ratio=1000)` retorna:
+
+| Chave | Conteúdo |
+| --- | --- |
+| `before`, `after` | Relatórios completos de `audit_zip`, com SHA-256 dos bytes exatos, entradas, resumo e alertas de cada origem. |
+| `added`, `removed` | Registros com `name`, `occurrence` e `entry` (a entrada completa da auditoria correspondente). |
+| `changed` | Registros com `name`, `occurrence`, entradas completas `before` e `after`, e `fields` com os nomes dos campos alterados. |
+| `summary` | Contagens inteiras `added`, `removed`, `changed` e `unchanged`. |
+
+O pareamento usa o **nome original decodificado exato e a ocorrência desse
+nome, começando em zero**, em cada diretório. Duplicatas continuam separadas.
+Não há conversão de maiúsculas/minúsculas nem normalização de barras, caminhos
+ou Unicode. Um membro renomeado é removido e adicionado. Apenas reordenar
+membros de nomes únicos não gera alteração: os índices absolutos do diretório
+permanecem nas entradas originais, mas não entram no cálculo das diferenças.
+Ocorrências duplicadas são pareadas em suas respectivas ordens; reordenar
+duplicatas com metadados diferentes pode gerar alterações.
+
+Os campos comparados, na ordem de `fields`, são `is_dir`, `compressed_size`,
+`uncompressed_size`, `crc32`, `compression`, `encrypted` e `is_symlink`.
+Adições e alterações seguem a ordem do diretório posterior; remoções seguem
+a ordem do anterior. Arquivos ZIP vazios são aceitos. Datas, comentários e
+bits de permissão além do indicador existente de link simbólico ficam fora
+do escopo das diferenças.
+
+Cada entrada segue, de forma independente, os mesmos limites de arquivo
+regular, **16 MiB** e **10.000 membros** e as verificações já descritas,
+inclusive a limitação da interpretação inicial do diretório. A opção de razão
+aplica-se às duas auditorias. A comparação lê cada captura da origem sem
+modificar arquivos, abrir ou descompactar membros, extrair arquivos, verificar
+CRCs ou criar arquivos de saída. Metadados iguais **não comprovam conteúdo
+igual**: os CRCs continuam sendo declarações não verificadas. Os SHA-256 dos
+arquivos completos ainda distinguem bytes de origem diferentes, inclusive
+alterações fora dos campos comparados.
+
+O status padrão da comparação é 0, inclusive quando existem diferenças.
+`--fail-on-changes` retorna 1 quando há adição, remoção ou alteração de
+metadados; usá-lo sem `--compare` causa erro de argumentos.
+`--fail-on-findings` retorna 1 se qualquer uma das auditorias originais tiver
+alertas. Com as duas opções, qualquer condição causa status 1. Opções inválidas
+ou qualquer origem inválida causam status 2, a mesma mensagem genérica sem
+dados privados em stderr e nenhum relatório parcial em stdout. O JSON mantém
+escapes ASCII; o Markdown usa a mesma representação inerte de nomes nas
+diferenças e nas duas auditorias incluídas.
+
 ### Exemplo sintético
 
 ```sh
@@ -258,5 +403,17 @@ duplicados, metadados Unix de link simbólico e dados altamente compactáveis.
 Ele se recusa a sobrescrever um arquivo existente. A auditoria lê somente os
 metadados do diretório: não segue o link nem cria os caminhos dos membros no
 disco. O criador grava conteúdo sintético para montar o exemplo.
+
+Para um exemplo completo de comparação, execute:
+
+```sh
+python -m examples.compare_synthetic
+```
+
+O exemplo cria dois ZIPs pequenos em uma pasta temporária, imprime a comparação
+em JSON e remove os arquivos. O resumo tem uma adição, uma remoção, duas
+alterações e uma entrada inalterada, com nomes duplicados pareados
+separadamente. O criador grava conteúdo fictício; a comparação lê somente as
+declarações do diretório e as capturas usadas para calcular os hashes.
 
 Licenciado sob a [licença MIT](LICENSE), copyright MartinLofrano.

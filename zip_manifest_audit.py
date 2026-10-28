@@ -16,12 +16,16 @@ import sys
 import zipfile
 from typing import Sequence
 
-__all__ = ["ArchiveError", "audit_zip"]
+__all__ = ["ArchiveError", "audit_zip", "compare_zips"]
 
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_ENTRIES = 10_000
 MAX_RATIO = 1_000_000
 _ERROR_MESSAGE = "Unable to audit ZIP archive."
+_COMPARISON_FIELDS = (
+    "is_dir", "compressed_size", "uncompressed_size", "crc32",
+    "compression", "encrypted", "is_symlink",
+)
 
 
 class ArchiveError(ValueError):
@@ -163,6 +167,78 @@ def audit_zip(
         raise ArchiveError(_ERROR_MESSAGE) from None
 
 
+def _occurrences(entries: list[dict]) -> dict[tuple[str, int], dict]:
+    """Index exact original names without losing duplicate directory entries."""
+    counts: dict[str, int] = {}
+    indexed = {}
+    for entry in entries:
+        name = entry["name"]
+        occurrence = counts.get(name, 0)
+        indexed[(name, occurrence)] = entry
+        counts[name] = occurrence + 1
+    return indexed
+
+
+def compare_zips(
+    before: str | os.PathLike[str],
+    after: str | os.PathLike[str],
+    *,
+    max_ratio: int = 1000,
+) -> dict:
+    """Compare bounded ZIP directory claims without reading member contents.
+
+    Both sources are audited independently. Entries match by exact original
+    name and zero-based occurrence of that name, with no path normalization.
+    Absolute directory indices are ignored for comparison. Equal metadata does
+    not establish equal payloads; timestamps, comments, and permission bits
+    other than the existing symlink flag are outside the delta scope.
+    """
+    before_report = audit_zip(before, max_ratio=max_ratio)
+    after_report = audit_zip(after, max_ratio=max_ratio)
+    before_entries = _occurrences(before_report["entries"])
+    after_entries = _occurrences(after_report["entries"])
+    added = []
+    changed = []
+    unchanged = 0
+    for (name, occurrence), after_entry in after_entries.items():
+        before_entry = before_entries.get((name, occurrence))
+        if before_entry is None:
+            added.append({"name": name, "occurrence": occurrence, "entry": after_entry})
+            continue
+        fields = [
+            field for field in _COMPARISON_FIELDS
+            if before_entry[field] != after_entry[field]
+        ]
+        if fields:
+            changed.append({
+                "name": name,
+                "occurrence": occurrence,
+                "before": before_entry,
+                "after": after_entry,
+                "fields": fields,
+            })
+        else:
+            unchanged += 1
+    removed = [
+        {"name": name, "occurrence": occurrence, "entry": entry}
+        for (name, occurrence), entry in before_entries.items()
+        if (name, occurrence) not in after_entries
+    ]
+    return {
+        "before": before_report,
+        "after": after_report,
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "summary": {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": unchanged,
+        },
+    }
+
+
 def _markdown_name(name: str) -> str:
     """Render a JSON-style literal that cannot supply markup or link syntax."""
     literal = json.dumps(name, ensure_ascii=True)
@@ -215,6 +291,61 @@ def _markdown(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _comparison_markdown(report: dict) -> str:
+    summary = report["summary"]
+    lines = [
+        "# ZIP manifest comparison",
+        "",
+        "Central-directory claims only. Equal metadata does not establish equal member contents.",
+        "Member contents and CRC integrity were not checked.",
+        "",
+        "Members match by exact original name and zero-based occurrence of that name.",
+        "Directory indices, timestamps, comments and other permission bits are outside delta scope.",
+        "",
+        f"Before SHA-256: `{report['before']['sha256']}`",
+        f"After SHA-256: `{report['after']['sha256']}`",
+        "",
+        f"Added: {summary['added']} | Removed: {summary['removed']} | "
+        f"Changed: {summary['changed']} | Unchanged: {summary['unchanged']}",
+    ]
+    for key, title in (("added", "Added"), ("removed", "Removed")):
+        lines.extend([
+            "", f"## {title}", "",
+            "| Name | Occurrence | Directory index |",
+            "| --- | --- | --- |",
+        ])
+        for row in report[key]:
+            lines.append(
+                f"| {_markdown_name(row['name'])} | {row['occurrence']} | {row['entry']['index']} |"
+            )
+        if not report[key]:
+            lines.extend(["", "None."])
+    lines.extend([
+        "", "## Changed", "",
+        "| Name | Occurrence | Field | Before | After |",
+        "| --- | --- | --- | --- | --- |",
+    ])
+    for row in report["changed"]:
+        for field in row["fields"]:
+            before = json.dumps(row["before"][field], ensure_ascii=True)
+            after = json.dumps(row["after"][field], ensure_ascii=True)
+            lines.append(
+                f"| {_markdown_name(row['name'])} | {row['occurrence']} | {field} | "
+                f"`{before}` | `{after}` |"
+            )
+    if not report["changed"]:
+        lines.extend(["", "None."])
+    # Include both complete audits, retaining their existing inert rendering.
+    # Demote their headings so each stays inside its comparison subsection.
+    for key, title in (("before", "Before audit"), ("after", "After audit")):
+        lines.extend(["", f"## {title}", ""])
+        lines.extend(
+            "##" + line if line.startswith("#") else line
+            for line in _markdown(report[key]).splitlines()
+        )
+    return "\n".join(lines) + "\n"
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         # argparse normally repeats rejected argument values in diagnostics.
@@ -228,24 +359,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Audit ZIP central-directory metadata without reading members.",
     )
     parser.add_argument("zip", metavar="ZIP", help="regular ZIP source, at most 16 MiB")
+    parser.add_argument(
+        "--compare", metavar="OTHERZIP", help="compare with a second regular ZIP source"
+    )
     parser.add_argument("--max-ratio", type=int, default=1000, metavar="N")
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument(
-        "--fail-on-findings", action="store_true", help="exit 1 when metadata findings exist"
+        "--fail-on-findings", action="store_true",
+        help="exit 1 when metadata findings exist in either audited archive",
+    )
+    parser.add_argument(
+        "--fail-on-changes", action="store_true", help="exit 1 for comparison deltas (requires --compare)"
     )
     arguments = parser.parse_args(argv)
+    if arguments.fail_on_changes and arguments.compare is None:
+        parser.error("--fail-on-changes requires --compare")
     try:
-        report = audit_zip(arguments.zip, max_ratio=arguments.max_ratio)
+        if arguments.compare is not None:
+            report = compare_zips(
+                arguments.zip, arguments.compare, max_ratio=arguments.max_ratio
+            )
+        else:
+            report = audit_zip(arguments.zip, max_ratio=arguments.max_ratio)
     except ArchiveError:
         print(f"error: {_ERROR_MESSAGE}", file=sys.stderr)
         return 2
-    output = (
-        json.dumps(report, ensure_ascii=True, indent=2) + "\n"
-        if arguments.format == "json"
-        else _markdown(report)
-    )
+    if arguments.format == "json":
+        output = json.dumps(report, ensure_ascii=True, indent=2) + "\n"
+    elif arguments.compare is not None:
+        output = _comparison_markdown(report)
+    else:
+        output = _markdown(report)
     sys.stdout.write(output)
-    return 1 if arguments.fail_on_findings and report["findings"] else 0
+    if arguments.compare is not None:
+        findings = report["before"]["findings"] or report["after"]["findings"]
+        changes = any(report["summary"][key] for key in ("added", "removed", "changed"))
+    else:
+        findings = report["findings"]
+        changes = False
+    return 1 if (
+        (arguments.fail_on_findings and findings)
+        or (arguments.fail_on_changes and changes)
+    ) else 0
 
 
 if __name__ == "__main__":
